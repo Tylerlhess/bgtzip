@@ -1,7 +1,7 @@
 //! Anomaly detection and reporting.
 //!
-//! Takes scored records and applies statistical thresholding to identify
-//! lines that deviate from normal patterns found by the LZ77 scanner.
+//! Provides both score-based detection (used by LZ77 and JSON paths) and
+//! a convenience wrapper for LZ77 `RecordAnalysis`.
 
 use crate::scorer::RecordAnalysis;
 
@@ -45,42 +45,119 @@ impl AnomalyReport {
 }
 
 // ---------------------------------------------------------------------------
-// Statistics helpers
+// Statistics helpers (pub(crate) so json_analyzer can use them)
 // ---------------------------------------------------------------------------
 
-fn mean(vals: &[f64]) -> f64 {
+pub(crate) fn mean(vals: &[f64]) -> f64 {
     if vals.is_empty() {
         return 0.0;
     }
     vals.iter().sum::<f64>() / vals.len() as f64
 }
 
-fn median_sorted(vals: &mut Vec<f64>) -> f64 {
+pub(crate) fn median_of(vals: &[f64]) -> f64 {
     if vals.is_empty() {
         return 0.0;
     }
-    vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = vals.len();
+    let mut sorted = vals.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = sorted.len();
     if n % 2 == 0 {
-        (vals[n / 2 - 1] + vals[n / 2]) / 2.0
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
     } else {
-        vals[n / 2]
+        sorted[n / 2]
     }
 }
 
-fn sample_stdev(vals: &[f64], m: f64) -> f64 {
+pub(crate) fn sample_stdev(vals: &[f64], m: f64) -> f64 {
     if vals.len() < 2 {
         return 0.0;
     }
-    let var: f64 = vals.iter().map(|&x| (x - m).powi(2)).sum::<f64>() / (vals.len() - 1) as f64;
+    let var: f64 =
+        vals.iter().map(|&x| (x - m).powi(2)).sum::<f64>() / (vals.len() - 1) as f64;
     var.sqrt()
 }
 
 // ---------------------------------------------------------------------------
-// Detection
+// Core detection — works on raw score slices
 // ---------------------------------------------------------------------------
 
-/// Detect anomalous records using the specified method.
+/// Select anomaly indices from a slice of scores using the given method.
+///
+/// Returns `(threshold_used, indices)` where indices are sorted by score
+/// descending.
+pub fn detect_indices(
+    scores: &[f64],
+    coverages: Option<&[f64]>,
+    method: DetectionMethod,
+    threshold: Option<f64>,
+    top_n: Option<usize>,
+) -> (f64, Vec<usize>) {
+    if scores.is_empty() {
+        return (0.0, Vec::new());
+    }
+
+    let (threshold_used, mut idx) = match method {
+        DetectionMethod::Score => {
+            let ms = mean(scores);
+            let ss = sample_stdev(scores, ms);
+            let t = threshold.unwrap_or(ms + 1.5 * ss);
+            let selected: Vec<usize> = scores
+                .iter()
+                .enumerate()
+                .filter(|(_, &s)| s >= t)
+                .map(|(i, _)| i)
+                .collect();
+            (t, selected)
+        }
+        DetectionMethod::Coverage => {
+            let covs = coverages.unwrap_or(scores);
+            let mc = mean(covs);
+            let sc = sample_stdev(covs, mc);
+            let t = threshold.unwrap_or((mc - 1.5 * sc).max(0.0));
+            let selected: Vec<usize> = covs
+                .iter()
+                .enumerate()
+                .filter(|(_, &c)| c <= t)
+                .map(|(i, _)| i)
+                .collect();
+            (t, selected)
+        }
+        DetectionMethod::Percentile => {
+            let pct = threshold.unwrap_or(0.05);
+            let n = ((scores.len() as f64 * pct).ceil() as usize).max(1);
+            let mut by_score: Vec<usize> = (0..scores.len()).collect();
+            by_score.sort_by(|&a, &b| {
+                scores[b].partial_cmp(&scores[a]).unwrap()
+            });
+            by_score.truncate(n);
+            (pct, by_score)
+        }
+        DetectionMethod::Top => {
+            let n = top_n.unwrap_or(10);
+            let mut by_score: Vec<usize> = (0..scores.len()).collect();
+            by_score.sort_by(|&a, &b| {
+                scores[b].partial_cmp(&scores[a]).unwrap()
+            });
+            by_score.truncate(n);
+            let t = by_score
+                .last()
+                .map(|&i| scores[i])
+                .unwrap_or(0.0);
+            (t, by_score)
+        }
+    };
+
+    // Final sort by score descending
+    idx.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap());
+    (threshold_used, idx)
+}
+
+// ---------------------------------------------------------------------------
+// LZ77-specific convenience wrapper
+// ---------------------------------------------------------------------------
+
+/// Detect anomalous records from LZ77 scored `RecordAnalysis`.
 pub fn detect_anomalies(
     records: &[RecordAnalysis],
     dict_entry_count: usize,
@@ -88,19 +165,18 @@ pub fn detect_anomalies(
     threshold: Option<f64>,
     top_n: Option<usize>,
 ) -> AnomalyReport {
-    let empty = AnomalyReport {
-        total_records: 0,
-        total_bytes: 0,
-        dict_entry_count,
-        mean_coverage: 0.0,
-        median_coverage: 0.0,
-        stdev_coverage: 0.0,
-        threshold: 0.0,
-        anomaly_count: 0,
-        anomaly_indices: Vec::new(),
-    };
     if records.is_empty() {
-        return empty;
+        return AnomalyReport {
+            total_records: 0,
+            total_bytes: 0,
+            dict_entry_count,
+            mean_coverage: 0.0,
+            median_coverage: 0.0,
+            stdev_coverage: 0.0,
+            threshold: 0.0,
+            anomaly_count: 0,
+            anomaly_indices: Vec::new(),
+        };
     }
 
     let total_bytes: usize = records.iter().map(|r| r.length).sum();
@@ -108,71 +184,11 @@ pub fn detect_anomalies(
     let scores: Vec<f64> = records.iter().map(|r| r.anomaly_score).collect();
 
     let mean_cov = mean(&coverages);
-    let mut cov_copy = coverages.clone();
-    let median_cov = median_sorted(&mut cov_copy);
+    let median_cov = median_of(&coverages);
     let stdev_cov = sample_stdev(&coverages, mean_cov);
 
-    let (threshold_used, mut anomaly_idx) = match method {
-        DetectionMethod::Score => {
-            let ms = mean(&scores);
-            let ss = sample_stdev(&scores, ms);
-            let t = threshold.unwrap_or(ms + 1.5 * ss);
-            let idx: Vec<usize> = records
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| r.anomaly_score >= t)
-                .map(|(i, _)| i)
-                .collect();
-            (t, idx)
-        }
-        DetectionMethod::Coverage => {
-            let t = threshold.unwrap_or((mean_cov - 1.5 * stdev_cov).max(0.0));
-            let idx: Vec<usize> = records
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| r.coverage <= t)
-                .map(|(i, _)| i)
-                .collect();
-            (t, idx)
-        }
-        DetectionMethod::Percentile => {
-            let pct = threshold.unwrap_or(0.05);
-            let n = ((records.len() as f64 * pct).ceil() as usize).max(1);
-            let mut by_score: Vec<usize> = (0..records.len()).collect();
-            by_score.sort_by(|&a, &b| {
-                records[b]
-                    .anomaly_score
-                    .partial_cmp(&records[a].anomaly_score)
-                    .unwrap()
-            });
-            by_score.truncate(n);
-            (pct, by_score)
-        }
-        DetectionMethod::Top => {
-            let n = top_n.unwrap_or(10);
-            let mut by_score: Vec<usize> = (0..records.len()).collect();
-            by_score.sort_by(|&a, &b| {
-                records[b]
-                    .anomaly_score
-                    .partial_cmp(&records[a].anomaly_score)
-                    .unwrap()
-            });
-            by_score.truncate(n);
-            let t = by_score
-                .last()
-                .map(|&i| records[i].anomaly_score)
-                .unwrap_or(0.0);
-            (t, by_score)
-        }
-    };
-
-    // Sort anomalies by score descending
-    anomaly_idx.sort_by(|&a, &b| {
-        records[b]
-            .anomaly_score
-            .partial_cmp(&records[a].anomaly_score)
-            .unwrap()
-    });
+    let (threshold_used, anomaly_idx) =
+        detect_indices(&scores, Some(&coverages), method, threshold, top_n);
 
     AnomalyReport {
         total_records: records.len(),
@@ -258,5 +274,14 @@ mod tests {
         for w in scores.windows(2) {
             assert!(w[0] >= w[1]);
         }
+    }
+
+    #[test]
+    fn detect_indices_basic() {
+        let scores = vec![0.1, 0.9, 0.2, 0.8, 0.15];
+        let (_, idx) = detect_indices(&scores, None, DetectionMethod::Top, None, Some(2));
+        assert_eq!(idx.len(), 2);
+        assert_eq!(idx[0], 1); // highest score
+        assert_eq!(idx[1], 3); // second highest
     }
 }
