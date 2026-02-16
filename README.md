@@ -48,7 +48,20 @@ JSON analyzer is used; otherwise the LZ77 scanner runs.
 
 ## Install
 
+### One-liner (any Linux/macOS machine)
+
+```bash
+curl -sSf https://raw.githubusercontent.com/Tylerlhess/bgtzip/master/install.sh | bash
 ```
+
+This will check for Rust, prompt to install it if missing, then build and
+install `bgtzip` into `~/.cargo/bin`.
+
+### From source
+
+```bash
+git clone https://github.com/Tylerlhess/bgtzip.git
+cd bgtzip
 cargo install --path .
 ```
 
